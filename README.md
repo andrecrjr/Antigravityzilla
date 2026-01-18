@@ -42,6 +42,7 @@ Start Antigravity with Chrome DevTools Protocol enabled:
 ```bash
 antigravity . --remote-debugging-port=9000
 ```
+(You will get this message: "Warning: 'remote-debugging-port' is not in the list of known options, but still passed to Electron/Chromium." that's fine)
 
 ### 2. Install Dependencies
 
@@ -62,7 +63,11 @@ Open your browser in the bathroom and navigate to:
 http://<your-local-ip>:3000
 ```
 
-This is over local network, so it will not work if you are on a different network, unless you use a VPN or something.
+## Problems?
+
+Problems setting up? Don't know how to do a step? Can't find an explanation? **Open Shit-Chat folder in antigravity and tell the agent what issues you are having**. It can read the code in one go.
+
+This is over local network, so it will not work if you are on a different network, unless you use a VPN or tailscale or something.
 
 The interface will automatically connect and display your Antigravity conversation in almost real-time.
 
