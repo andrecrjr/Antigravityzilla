@@ -5,6 +5,9 @@ import http from 'http';
 import WebSocket from 'ws';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -94,7 +97,7 @@ async function connectCDP(url) {
 async function extractMetadata(cdp) {
     const SCRIPT = `(() => {
         const cascade = document.getElementById('cascade');
-        if (!cascade) return { found: false };
+        if (!cascade) return { found: false, reason: 'no cascade element' };
         
         let chatTitle = null;
         const possibleTitleSelectors = ['h1', 'h2', 'header', '[class*="title"]'];
@@ -106,10 +109,46 @@ async function extractMetadata(cdp) {
             }
         }
         
+        // Multi-method conversation ID detection
+        let conversationId = null;
+        
+        // Method 1: URL pathname (e.g., /brain/UUID/...)
+        try {
+            const pathMatch = window.location.pathname.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/);
+            if (pathMatch) conversationId = pathMatch[1];
+        } catch (e) {}
+        
+        // Method 2: URL hash
+        if (!conversationId) {
+            try {
+                const hashMatch = window.location.hash.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/);
+                if (hashMatch) conversationId = hashMatch[1];
+            } catch (e) {}
+        }
+        
+        // Method 3: localStorage
+        if (!conversationId) {
+            try {
+                const stored = localStorage.getItem('conversationId') || localStorage.getItem('currentConversationId');
+                if (stored && stored.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/)) {
+                    conversationId = stored;
+                }
+            } catch (e) {}
+        }
+        
+        // Method 4: Data attributes on cascade element
+        if (!conversationId) {
+            try {
+                conversationId = cascade.dataset.conversationId || cascade.getAttribute('data-conversation-id');
+            } catch (e) {}
+        }
+        
         return {
             found: true,
             chatTitle: chatTitle || 'Agent',
-            isActive: document.hasFocus()
+            isActive: document.hasFocus(),
+            conversationId: conversationId,
+            url: window.location.href
         };
     })()`;
 
@@ -118,7 +157,11 @@ async function extractMetadata(cdp) {
         try {
             const res = await cdp.call("Runtime.evaluate", { expression: SCRIPT, returnByValue: true, contextId: cdp.rootContextId });
             if (res.result?.value?.found) return { ...res.result.value, contextId: cdp.rootContextId };
-        } catch (e) { cdp.rootContextId = null; } // reset if stale
+            if (res.result?.value?.reason) console.log(`  ⚠️  Metadata check failed: ${res.result.value.reason}`);
+        } catch (e) { 
+            console.log(`  ❌ Metadata extraction error: ${e.message}`);
+            cdp.rootContextId = null; 
+        }
     }
 
     // Search all contexts
@@ -200,6 +243,64 @@ async function captureHTML(cdp) {
     return null;
 }
 
+// Brain Artifact Helpers
+
+function getMostRecentBrainDir() {
+    try {
+        const userHome = os.homedir();
+        const brainBasePath = path.join(userHome, '.gemini', 'antigravity', 'brain');
+        
+        if (!fs.existsSync(brainBasePath)) return null;
+        
+        const entries = fs.readdirSync(brainBasePath, { withFileTypes: true });
+        const dirs = entries
+            .filter(e => e.isDirectory())
+            .filter(e => e.name.match(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/))
+            .map(e => {
+                const dirPath = path.join(brainBasePath, e.name);
+                const stats = fs.statSync(dirPath);
+                return { name: e.name, mtime: stats.mtime };
+            })
+            .sort((a, b) => b.mtime - a.mtime); // Most recent first
+        
+        return dirs.length > 0 ? dirs[0].name : null;
+    } catch (e) {
+        console.error('Error finding recent brain dir:', e.message);
+        return null;
+    }
+}
+
+function readBrainArtifacts(conversationId) {
+    if (!conversationId) return null;
+    
+    // Construct path: ~/.gemini/antigravity/brain/{id}
+    const userHome = os.homedir();
+    const brainPath = path.join(userHome, '.gemini', 'antigravity', 'brain', conversationId);
+    
+    const artifacts = {
+        implementation_plan: null,
+        task: null,
+        walkthrough: null
+    };
+    
+    try {
+        const planPath = path.join(brainPath, 'implementation_plan.md');
+        if (fs.existsSync(planPath)) artifacts.implementation_plan = fs.readFileSync(planPath, 'utf8');
+    } catch (e) {}
+    
+    try {
+        const taskPath = path.join(brainPath, 'task.md');
+        if (fs.existsSync(taskPath)) artifacts.task = fs.readFileSync(taskPath, 'utf8');
+    } catch (e) {}
+    
+    try {
+        const walkthroughPath = path.join(brainPath, 'walkthrough.md');
+        if (fs.existsSync(walkthroughPath)) artifacts.walkthrough = fs.readFileSync(walkthroughPath, 'utf8');
+    } catch (e) {}
+    
+    return artifacts;
+}
+
 // --- Main App Logic ---
 
 async function discover() {
@@ -240,13 +341,25 @@ async function discover() {
 
             if (meta) {
                 if (meta.contextId) cdp.rootContextId = meta.contextId;
+                
+                // Fallback: Use most recent brain dir if no conversationId found
+                let conversationId = meta.conversationId;
+                if (!conversationId) {
+                    conversationId = getMostRecentBrainDir();
+                    if (conversationId) {
+                        console.log(`  📁 Using most recent brain dir: ${conversationId}`);
+                    }
+                }
+                
                 const cascade = {
                     id,
                     cdp,
                     metadata: {
                         windowTitle: target.title,
                         chatTitle: meta.chatTitle,
-                        isActive: meta.isActive
+                        isActive: meta.isActive,
+                        conversationId: conversationId,
+                        url: meta.url || null
                     },
                     snapshot: null,
                     css: await captureCSS(cdp), //only on init bc its huge
@@ -274,6 +387,34 @@ async function discover() {
     cascades = newCascades;
 
     if (changed) broadcastCascadeList();
+}
+
+// Heuristic to get a useful project/workspace name from the window title
+function extractProjectName(title) {
+    if (!title) return '';
+    
+    // Common formats:
+    // "filename.js - ProjectName - EditorName"
+    // "ProjectName - EditorName"
+    
+    const parts = title.split(' - ');
+    
+    // If we have 3 or more parts, the project name is likely the second-to-last
+    // e.g. "server.js - Antigravityzilla - Cursor" -> "Antigravityzilla"
+    if (parts.length >= 3) {
+        return parts[parts.length - 2];
+    }
+    
+    // If 2 parts, usually "File - Editor" or "Project - Editor"
+    // Hard to distinguish without knowing the editor name, but let's try returning the first part
+    // providing it's not a generic file name. 
+    // Actually, often "ProjectName" comes first in some views.
+    // Let's just return the whole thing if we can't be sure, or the first part.
+    if (parts.length === 2) {
+       return parts[0]; 
+    }
+
+    return title; 
 }
 
 async function updateSnapshots() {
@@ -306,6 +447,7 @@ function broadcastCascadeList() {
         id: c.id,
         title: c.metadata.chatTitle,
         window: c.metadata.windowTitle,
+        projectName: extractProjectName(c.metadata.windowTitle),
         active: c.metadata.isActive
     }));
     broadcast({ type: 'cascade_list', cascades: list });
@@ -342,11 +484,60 @@ async function main() {
         res.json({ css: c.css || '' });
     });
 
+    app.get('/brain/:id', async (req, res) => {
+        const c = cascades.get(req.params.id);
+        if (!c) return res.status(404).json({ error: 'Cascade not found' });
+        
+        const conversationId = c.metadata.conversationId;
+        if (!conversationId) {
+            return res.json({ 
+                implementation_plan: null, 
+                task: null, 
+                walkthrough: null,
+                error: 'No conversation ID found',
+                debug: {
+                    url: c.metadata.url,
+                    title: c.metadata.windowTitle
+                }
+            });
+        }
+        
+        try {
+            const artifacts = readBrainArtifacts(conversationId);
+            res.json(artifacts || { implementation_plan: null, task: null, walkthrough: null });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     // Alias for simple single-view clients (returns first active or first available)
     app.get('/snapshot', (req, res) => {
         const active = Array.from(cascades.values()).find(c => c.metadata.isActive) || cascades.values().next().value;
         if (!active || !active.snapshot) return res.status(503).json({ error: 'No snapshot' });
         res.json(active.snapshot);
+    });
+
+    app.post('/create/:id', async (req, res) => {
+        const c = cascades.get(req.params.id);
+        if (!c) return res.status(404).json({ error: 'Cascade not found' });
+
+        console.log(`🆕 Creating new agent for ${c.metadata.chatTitle}`);
+        try {
+            // Simulate Ctrl+Shift+L
+            await c.cdp.call("Input.dispatchKeyEvent", {
+                type: "rawKeyDown",
+                modifiers: 10, // Ctrl=2, Shift=8 -> 10? Or bitwise. 
+                // Modifiers: None: 0, Alt: 1, Ctrl: 2, Meta/Cmd: 4, Shift: 8
+                windowsVirtualKeyCode: 76, // L
+                key: "L",
+                code: "KeyL"
+            });
+            await c.cdp.call("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 76, key: "L", code: "KeyL" });
+            
+            res.json({ success: true });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
     });
 
     app.post('/send/:id', async (req, res) => {
